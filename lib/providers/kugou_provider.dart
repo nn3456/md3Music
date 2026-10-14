@@ -13,6 +13,7 @@ import '../core/services/listening_grade_service.dart';
 import '../services/kugou_api/kugou_api_client.dart';
 import '../services/kugou_api/lyric_lookup_result.dart';
 import '../services/kugou_api/kugou_models.dart';
+import '../modules/user/vip_status.dart';
 import 'lyric_request_lifecycle.dart';
 
 /// 待处理的二次安全验证请求（签到/登录遇 error_code=20028 时产生）。
@@ -2737,6 +2738,17 @@ class KugouProvider extends ChangeNotifier {
   // ==================== User (用户) ====================
 
   Future<void> getVipDetail() async {
+    // 优先走批量会员接口：能拿到已购长期会员（随心畅听包 wvip 等），
+    // /user/vip/detail（union_vip）只返回各业务线的签到日卡。
+    try {
+      final entries = await _apiClient.fetchBatchBusiVip();
+      if (entries != null && entries.isNotEmpty) {
+        _vipInfo = _normalizeBusiVipEntries(entries);
+        notifyListeners();
+        return;
+      }
+    } catch (_) {}
+    // 回退：本地 /user/vip/detail
     try {
       final r = await _apiClient.getUserVipDetail();
       if (r != null) {
@@ -2744,6 +2756,30 @@ class KugouProvider extends ChangeNotifier {
         notifyListeners();
       }
     } catch (_) {}
+  }
+
+  /// 把批量接口返回的业务线条目归一化为 [KugouUserVipDetail]。
+  ///
+  /// 服务端按业务线分条返回已开通记录（tvip 签到日卡 / wvip 已购长期会员…），
+  /// 而各 UI 页面按 `product_type` 固定取 tvip 展示「畅听会员」。这里把非
+  /// 概念版（svip）业务线中最晚的有效到期时间写回 tvip 条目，使该行显示账号
+  /// 当前生效的最终到期时间——与官方 App「会员总时长」口径一致（例：已购随心
+  /// 畅听包到 2026-11-14，则显示该日期而非签到日卡的「23小时后到期」）。
+  KugouUserVipDetail _normalizeBusiVipEntries(List<Map<String, dynamic>> entries) {
+    final list = List<Map<String, dynamic>>.of(entries);
+    final latest = findLatestActiveBusiVip(list, excludeType: 'svip');
+    if (latest != null) {
+      final end = latest['vip_end_time']?.toString();
+      final idx =
+          list.indexWhere((b) => b['product_type']?.toString() == 'tvip');
+      if (end != null && end.isNotEmpty && idx >= 0) {
+        list[idx] = {...list[idx], 'vip_end_time': end};
+      }
+    }
+    return KugouUserVipDetail(
+      isVip: list.any((b) => b['is_vip'] == 1),
+      busiVipList: list,
+    );
   }
 
   /// 拉取听歌等级信息，并同步服务器累计时长到本地基准（避免上报被拒）。
