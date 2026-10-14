@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../data/models/dy_cover_models.dart';
@@ -3838,6 +3841,90 @@ class KugouApiClient {
     } catch (e) {
       return null;
     }
+  }
+
+  /// 批量会员信息（直连酷狗上游 kugouvip.kugou.com，绕过本地 Rust 服务）。
+  ///
+  /// 本地 `/user/vip/detail` 只转发 `/v1/get_union_vip`，仅返回各业务线的
+  /// 签到日卡；已购长期会员（如随心畅听包 wvip）只在
+  /// `POST https://kugouvip.kugou.com/v2/batch_union_vipinfo` 的
+  /// `data.busi_vip[<userid>]` 中返回。此处按本地服务相同的签名配方
+  /// （`md5(ROUTE + 排序参数拼接 + body原文 + ROUTE)`，ROUTE 与 Rust
+  /// `helper.rs` 一致；appid/clientver 取概念版常量）直接请求上游。
+  /// 任何失败返回 null，由调用方回退到 `/user/vip/detail`。
+  Future<List<Map<String, dynamic>>?> fetchBatchBusiVip() async {
+    final token = _token;
+    final useridRaw = _userid;
+    if (token == null || token.isEmpty || useridRaw == null || useridRaw.isEmpty) {
+      return null;
+    }
+    final mid = await _readDeviceMid();
+    if (mid == null || mid.isEmpty) return null;
+
+    const route = 'LnT6xpN3khm36zse0QzvmgTZ3waWdRSA';
+    final userid = int.tryParse(useridRaw) ?? 0;
+    final params = <String, dynamic>{
+      'appid': 3116,
+      'clientver': 11440,
+      'clienttime': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      'dfid': _dfid ?? '',
+      'mid': mid,
+      'token': token,
+      'userid': userid,
+    };
+    // body 必须紧凑 JSON（无空格）且键序固定，与签名计算逐字节一致
+    final body = jsonEncode({
+      'useridlist': [userid],
+      'get_type': 2,
+      'busi_type': 'concept',
+    });
+    final joined = (params.keys.toList()..sort())
+        .map((k) => '$k=${params[k]}')
+        .join();
+    params['signature'] =
+        md5.convert(utf8.encode(route + joined + body + route)).toString();
+
+    try {
+      // 全新 Dio 实例：避开全局拦截器（cookie/dfid 注入会破坏已计算的签名）
+      final res = await Dio().post<dynamic>(
+        'https://kugouvip.kugou.com/v2/batch_union_vipinfo',
+        queryParameters: params,
+        data: body,
+        options: Options(
+          headers: {'Content-Type': 'application/json;charset=utf-8'},
+          responseType: ResponseType.plain,
+          validateStatus: (s) => s != null && s >= 200 && s < 500,
+        ),
+      );
+      if (res.data is! String) return null;
+      final json = jsonDecode(res.data as String);
+      if (json is! Map<String, dynamic>) return null;
+      final data = json['data'];
+      if (data is! Map<String, dynamic>) return null;
+      final busi = data['busi_vip'];
+      if (busi is! Map<String, dynamic>) return null;
+      final list = busi[useridRaw] ?? busi[userid.toString()];
+      if (list is! List) return null;
+      return list.whereType<Map<String, dynamic>>().toList();
+    } catch (e) {
+      print('[fetchBatchBusiVip] error: $e');
+      return null;
+    }
+  }
+
+  /// 读取 Rust 服务持久化的 `device_info.json` 中的 mid（上游签名必填，
+  /// 缺 mid 上游返回 error_code 20006）。文件由本地服务注册设备时写入
+  /// App 的 files 目录。
+  Future<String?> _readDeviceMid() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final f = File('${dir.path}/device_info.json');
+      if (await f.exists()) {
+        final j = jsonDecode(await f.readAsString());
+        if (j is Map && j['mid'] != null) return j['mid'].toString();
+      }
+    } catch (_) {}
+    return null;
   }
 
   /// 查询/上报听歌等级信息（v2/lite 协议）。
