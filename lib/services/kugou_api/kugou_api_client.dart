@@ -3931,6 +3931,98 @@ class KugouApiClient {
     }
   }
 
+  /// 会员入口信息（直连上游 `youth/v1/user/get_vip_entrance`）。
+  ///
+  /// 该端点一次给出各业务线的「含未领天数」累计到期日——即官方 App「我的」页
+  /// 会员卡片的展示口径：
+  ///   - `tvip_end_date_with_unclaimed` → 畅听会员（含各活动累积的年卡天数）
+  ///   - `svip_end_date_with_unclaimed` → 概念会员
+  ///   - `busi_vip[].vip_end_time`       → 各业务线当前周期（含随心畅听包 wvip）
+  /// 本地 Rust 服务未实现该路由，故按批量接口相同的签名配方直连上游。
+  /// 失败返回 null，由调用方逐级回退。
+  Future<List<Map<String, dynamic>>?> fetchVipEntrance() async {
+    final token = _token;
+    final useridRaw = _userid;
+    if (token == null || token.isEmpty || useridRaw == null || useridRaw.isEmpty) {
+      print('[fetchVipEntrance] 跳过：无 token/userid');
+      return null;
+    }
+    final dev = await _fetchLocalDevice();
+    final mid = dev?['mid']?.toString();
+    final dfid = dev?['dfid']?.toString() ?? _dfid ?? '';
+    if (mid == null || mid.isEmpty || dfid.isEmpty) {
+      print('[fetchVipEntrance] 跳过：local_device 缺 mid/dfid');
+      return null;
+    }
+
+    const route = 'LnT6xpN3khm36zse0QzvmgTZ3waWdRSA';
+    final userid = int.tryParse(useridRaw) ?? 0;
+    final params = <String, dynamic>{
+      'appid': 3116,
+      'clientver': 11440,
+      'clienttime': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      'dfid': dfid,
+      'mid': mid,
+      'token': token,
+      'userid': userid,
+    };
+    final joined = (params.keys.toList()..sort())
+        .map((k) => '$k=${params[k]}')
+        .join();
+    params['signature'] =
+        md5.convert(utf8.encode(route + joined + route)).toString();
+
+    try {
+      // 全新 Dio 实例：避开全局拦截器（cookie/dfid 注入会破坏已计算的签名）
+      final res = await Dio().get<dynamic>(
+        'https://gateway.kugou.com/youth/v1/user/get_vip_entrance',
+        queryParameters: params,
+        options: Options(
+          headers: const {
+            'User-Agent': 'Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi',
+          },
+          responseType: ResponseType.plain,
+          validateStatus: (s) => s != null && s >= 200 && s < 500,
+        ),
+      );
+      final raw = res.data?.toString() ?? '';
+      print('[fetchVipEntrance] HTTP ${res.statusCode} len=${raw.length}');
+      if (raw.length < 300) print('[fetchVipEntrance] body: $raw');
+      final json = jsonDecode(raw);
+      if (json is! Map<String, dynamic>) return null;
+      final data = json['data'];
+      if (data is! Map<String, dynamic>) return null;
+      final busi = data['busi_vip'];
+      if (busi is! List) return null;
+      final entries = busi.whereType<Map<String, dynamic>>().toList();
+      // 用「含未领天数」的累计到期日覆盖当前周期（官方 App 展示口径）：
+      // 畅听会员年卡天数来自各处活动累积，只在 tvip_end_date_with_unclaimed 体现。
+      _overrideVipEnd(entries, 'tvip', data['tvip_end_date_with_unclaimed']?.toString());
+      _overrideVipEnd(entries, 'svip', data['svip_end_date_with_unclaimed']?.toString());
+      print('[fetchVipEntrance] 命中 ${entries.length} 条: '
+          '${entries.map((e) => "${e["product_type"]}=${e["vip_end_time"]}").join(", ")}');
+      return entries;
+    } catch (e) {
+      print('[fetchVipEntrance] 异常: $e');
+      return null;
+    }
+  }
+
+  /// 把指定业务线的 `vip_end_time` 覆盖为累计到期日。
+  /// 纯日期（无时间分量）补到当天 23:59:59，展示更直观。
+  void _overrideVipEnd(
+    List<Map<String, dynamic>> entries,
+    String productType,
+    String? date,
+  ) {
+    if (date == null || date.isEmpty) return;
+    final idx =
+        entries.indexWhere((e) => e['product_type']?.toString() == productType);
+    if (idx < 0) return;
+    final v = date.length <= 10 ? '$date 23:59:59' : date;
+    entries[idx] = {...entries[idx], 'vip_end_time': v};
+  }
+
   /// 获取本机设备标识（mid/dfid）——读本地 Rust 服务 `/login/device` 响应顶层
   /// 注入的 `local_device` 字段（Rust `handle_device` 用 DeviceConfig 注入，
   /// 即服务自身签名时使用的同一套值，天然一致）。
