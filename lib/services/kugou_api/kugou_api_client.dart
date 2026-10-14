@@ -3863,11 +3863,11 @@ class KugouApiClient {
       print('[fetchBatchBusiVip] 跳过：无 token/userid');
       return null;
     }
-    final dev = await _readDeviceInfo();
+    final dev = await _fetchLocalDevice();
     final mid = dev?['mid']?.toString();
     final dfid = dev?['dfid']?.toString() ?? _dfid ?? '';
     if (mid == null || mid.isEmpty || dfid.isEmpty) {
-      print('[fetchBatchBusiVip] 跳过：device_info 缺 mid/dfid'
+      print('[fetchBatchBusiVip] 跳过：local_device 缺 mid/dfid'
           ' (mid=${mid != null}, dfid非空=${dfid.isNotEmpty})');
       return null;
     }
@@ -3931,27 +3931,23 @@ class KugouApiClient {
     }
   }
 
-  /// 读取 Rust 服务持久化的 `device_info.json`（含 mid/dfid，上游签名必填）。
-  /// 文件由本地服务注册设备时写入 App 的 files 目录；按多个候选目录查找，
-  /// 规避 path_provider 在不同平台/版本上的目录差异。
-  Future<Map<String, dynamic>?> _readDeviceInfo() async {
-    final dirs = <String>{};
+  /// 获取本机设备标识（mid/dfid）——读本地 Rust 服务 `/login/device` 响应顶层
+  /// 注入的 `local_device` 字段（Rust `handle_device` 用 DeviceConfig 注入，
+  /// 即服务自身签名时使用的同一套值，天然一致）。
+  ///
+  /// 不读 device_info.json：该文件由服务注册时写入，重装/清数据后会缺失，
+  /// 且 path_provider 的目录在不同平台/版本上有差异。
+  Future<Map<String, dynamic>?> _fetchLocalDevice() async {
     try {
-      dirs.add((await getApplicationDocumentsDirectory()).path);
-    } catch (_) {}
-    try {
-      dirs.add((await getApplicationSupportDirectory()).path);
-    } catch (_) {}
-    for (final dir in dirs) {
-      for (final rel in const ['device_info.json', 'files/device_info.json']) {
-        try {
-          final f = File('$dir/$rel');
-          if (await f.exists()) {
-            final j = jsonDecode(await f.readAsString());
-            if (j is Map<String, dynamic> && j['mid'] != null) return j;
-          }
-        } catch (_) {}
+      final json = await _get(KugouEndpoints.loginDevice);
+      final local = json?['local_device'];
+      if (local is Map<String, dynamic> &&
+          local['mid'] != null &&
+          local['dfid'] != null) {
+        return local;
       }
+    } catch (e) {
+      print('[fetchBatchBusiVip] _fetchLocalDevice 异常: $e');
     }
     return null;
   }
