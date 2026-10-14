@@ -1099,6 +1099,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
     final vip = kugou.vipInfo;
     final busiList = vip?.busiVipList;
     final tvip = findActiveBusiVip(busiList, 'tvip');
+    final wvip = findActiveBusiVip(busiList, 'wvip');
     final svip = findActiveBusiVip(busiList, 'svip');
     return SliverToBoxAdapter(
       child: Container(
@@ -1137,6 +1138,16 @@ class _UserCenterPageState extends State<UserCenterPage> {
                             icon: Icons.headphones,
                             iconBg: cs.secondaryContainer,
                             iconFg: cs.onSecondaryContainer,
+                          ),
+                          const Gap(AppSpacing.sm),
+                          _buildVipRow(
+                            cs: cs,
+                            tt: tt,
+                            active: wvip,
+                            title: '随心畅听包',
+                            icon: Icons.card_membership,
+                            iconBg: cs.tertiaryContainer,
+                            iconFg: cs.onTertiaryContainer,
                           ),
                           const Gap(AppSpacing.sm),
                           _buildVipRow(
