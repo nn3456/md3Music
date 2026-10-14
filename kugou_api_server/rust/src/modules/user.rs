@@ -1342,11 +1342,106 @@ pub fn handle_video_love(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleR
 }
 
 /// user_vip_detail.js → /user/vip/detail（联合 VIP 信息）。
+///
+/// 除原有 `/v1/get_union_vip` 外，额外请求 `/v2/batch_union_vipinfo`
+/// （POST body `{useridlist, get_type:2, busi_type:"concept"}`）——该端点返回
+/// 全部业务线的已开通记录，包含 get_union_vip 不返回的已购长期会员（如随心畅听包
+/// wvip）。批量结果按 userid 取出条目数组后覆盖 base 响应的 `data.busi_vip`，
+/// 使客户端能看到完整的会员到期时间。批量请求失败或结构不符时静默回退为
+/// 原有响应，不影响原功能。
 pub fn handle_vip_detail(q: &Value, ctx: &Ctx) -> Result<ModuleResponse, ModuleResponse> {
-    forward(
+    let base = forward(
         q, ctx, "GET", "/v1/get_union_vip", Some("https://kugouvip.kugou.com"),
         Some(json!({ "busi_type": "concept" })), None, "android", &[], false, false,
-    )
+    )?;
+
+    let userid = cookie_or_param_num(q, "userid", 0);
+    let batch_body = json!({
+        "useridlist": [userid],
+        "get_type": 2,
+        "busi_type": "concept",
+    });
+    let batch = match forward(
+        q, ctx, "POST", "/v2/batch_union_vipinfo", Some("https://kugouvip.kugou.com"),
+        None, Some(batch_body), "android", &[], false, false,
+    ) {
+        Ok(r) => r,
+        Err(_) => return Ok(base),
+    };
+
+    // 批量响应结构：{ data: { busi_vip: { "<userid>": [条目...] } } }
+    let entries = batch
+        .body
+        .to_json()
+        .get("data")
+        .and_then(|d| d.get("busi_vip"))
+        .and_then(|b| b.get(userid.to_string()))
+        .and_then(|e| e.as_array())
+        .cloned();
+    let Some(entries) = entries else {
+        return Ok(base);
+    };
+
+    // 用批量条目覆盖 base 的 data.busi_vip（其余顶层字段保持 base 原值）
+    let mut body = base.body.to_json();
+    if let Some(obj) = body.as_object_mut() {
+        let data = obj.entry("data").or_insert_with(|| json!({}));
+        if let Some(dm) = data.as_object_mut() {
+            dm.insert("busi_vip".to_string(), json!(entries));
+        }
+    }
+
+    // 展示归一化：账号可能同时存在签到日卡（tvip）与已购长期会员（wvip 等）。
+    // 各 UI 页面按 product_type 固定取 tvip 展示「畅听会员」，此处把非 svip
+    // 已开通业务线中最晚的有效到期时间写回 tvip 条目，使该行显示账号当前生效
+    // 的最终到期时间（与官方 App「会员总时长」口径一致），而非仅显示签到日卡。
+    remap_latest_end_into_tvip(&mut body);
+
+    Ok(ModuleResponse {
+        status: base.status,
+        body: BodyValue::Json(body),
+        cookie: base.cookie,
+        headers: base.headers,
+    })
+}
+
+/// 把非 svip 已开通业务线中最晚的 `vip_end_time` 写回 tvip 条目（仅展示用途）。
+///
+/// 到期时间格式统一为 `yyyy-MM-dd HH:mm:ss`（零填充），可按字符串直接比较。
+/// 无更晚记录或无 tvip 条目时保持原样。
+fn remap_latest_end_into_tvip(body: &mut Value) {
+    let Some(data) = body.get_mut("data").and_then(|d| d.as_object_mut()) else {
+        return;
+    };
+    let Some(list) = data.get_mut("busi_vip").and_then(|b| b.as_array_mut()) else {
+        return;
+    };
+
+    // 非 svip 已开通条目中最晚的到期时间（拥有权拷贝，避免与下方可变借用冲突）
+    let mut latest: Option<String> = None;
+    for e in list.iter() {
+        if e.get("is_vip").and_then(|v| v.as_i64()) != Some(1) {
+            continue;
+        }
+        if e.get("product_type").and_then(|v| v.as_str()) == Some("svip") {
+            continue;
+        }
+        if let Some(t) = e.get("vip_end_time").and_then(|v| v.as_str()) {
+            if !t.is_empty() && latest.as_ref().map_or(true, |l| t > l) {
+                latest = Some(t.to_string());
+            }
+        }
+    }
+    let Some(latest) = latest else { return };
+
+    for e in list.iter_mut() {
+        if e.get("product_type").and_then(|v| v.as_str()) == Some("tvip") {
+            if let Some(m) = e.as_object_mut() {
+                m.insert("vip_end_time".to_string(), json!(latest));
+            }
+            break;
+        }
+    }
 }
 
 /// user_grade_info.js → /user/grade/info（听歌等级信息查询与听歌时长上报，v2/lite 协议）。
