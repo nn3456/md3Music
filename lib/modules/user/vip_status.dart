@@ -45,6 +45,37 @@ DateTime? _parseVipEndTime(Object? value) {
   return DateTime.tryParse(s.replaceFirst(' ', 'T'));
 }
 
+/// 取所有已开通业务线中 `vip_end_time` **最晚**的一条（可排除指定
+/// `product_type`）。
+///
+/// 账号可能同时存在多条同族已开通记录——如每日签到领取的日卡（tvip）与已购的
+/// 长期会员（wvip 等）。展示「畅听会员」的生效到期时间时应取最晚者，与官方
+/// App「会员总时长」口径一致，而非仅显示某一条业务线（如签到日卡）的到期时间。
+/// 找不到返回 null。
+Map<String, dynamic>? findLatestActiveBusiVip(
+  List<Map<String, dynamic>>? list, {
+  String? excludeType,
+}) {
+  if (list == null) return null;
+  Map<String, dynamic>? best;
+  DateTime? bestEnd;
+  for (final b in list) {
+    if (b['is_vip'] != 1) continue;
+    if (excludeType != null && b['product_type']?.toString() == excludeType) {
+      continue;
+    }
+    final end = _parseVipEndTime(b['vip_end_time']);
+    if (best == null) {
+      best = b;
+      bestEnd = end;
+    } else if (end != null && (bestEnd == null || end.isAfter(bestEnd))) {
+      best = b;
+      bestEnd = end;
+    }
+  }
+  return best;
+}
+
 /// 相对到期时间文案（移植自 EchoMusic Profile.vue 的 `getVipExpireText`）。
 /// `endTime` 形如 `"2026-08-16 10:30:00"`；无值或解析失败返回 null。
 String? formatVipExpireText(String? endTime) {
