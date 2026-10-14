@@ -3845,21 +3845,32 @@ class KugouApiClient {
 
   /// 批量会员信息（直连酷狗上游 kugouvip.kugou.com，绕过本地 Rust 服务）。
   ///
-  /// 本地 `/user/vip/detail` 只转发 `/v1/get_union_vip`，仅返回各业务线的
-  /// 签到日卡；已购长期会员（如随心畅听包 wvip）只在
+  /// 本地 `/user/vip/detail` 只转发 `/v1/get_union_vip`，仅返回各业务线当前
+  /// 周期；已购长期会员（如随心畅听包 wvip）只在
   /// `POST https://kugouvip.kugou.com/v2/batch_union_vipinfo` 的
   /// `data.busi_vip[<userid>]` 中返回。此处按本地服务相同的签名配方
   /// （`md5(ROUTE + 排序参数拼接 + body原文 + ROUTE)`，ROUTE 与 Rust
   /// `helper.rs` 一致；appid/clientver 取概念版常量）直接请求上游。
-  /// 任何失败返回 null，由调用方回退到 `/user/vip/detail`。
+  ///
+  /// 注意：mid 与 dfid 均为上游必填（缺失/为空返回 error_code 20006），必须从
+  /// Rust 服务持久化的 `device_info.json` 读取——客户端 SharedPreferences 在
+  /// 新版本已不再保存 kugou_dfid（`_dfid` 可能为 null）。任何失败返回 null，
+  /// 由调用方回退到 `/user/vip/detail`。
   Future<List<Map<String, dynamic>>?> fetchBatchBusiVip() async {
     final token = _token;
     final useridRaw = _userid;
     if (token == null || token.isEmpty || useridRaw == null || useridRaw.isEmpty) {
+      print('[fetchBatchBusiVip] 跳过：无 token/userid');
       return null;
     }
-    final mid = await _readDeviceMid();
-    if (mid == null || mid.isEmpty) return null;
+    final dev = await _readDeviceInfo();
+    final mid = dev?['mid']?.toString();
+    final dfid = dev?['dfid']?.toString() ?? _dfid ?? '';
+    if (mid == null || mid.isEmpty || dfid.isEmpty) {
+      print('[fetchBatchBusiVip] 跳过：device_info 缺 mid/dfid'
+          ' (mid=${mid != null}, dfid非空=${dfid.isNotEmpty})');
+      return null;
+    }
 
     const route = 'LnT6xpN3khm36zse0QzvmgTZ3waWdRSA';
     final userid = int.tryParse(useridRaw) ?? 0;
@@ -3867,7 +3878,7 @@ class KugouApiClient {
       'appid': 3116,
       'clientver': 11440,
       'clienttime': DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      'dfid': _dfid ?? '',
+      'dfid': dfid,
       'mid': mid,
       'token': token,
       'userid': userid,
@@ -3891,13 +3902,18 @@ class KugouApiClient {
         queryParameters: params,
         data: body,
         options: Options(
-          headers: {'Content-Type': 'application/json;charset=utf-8'},
+          headers: const {
+            'Content-Type': 'application/json;charset=utf-8',
+            'User-Agent': 'Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi',
+          },
           responseType: ResponseType.plain,
           validateStatus: (s) => s != null && s >= 200 && s < 500,
         ),
       );
-      if (res.data is! String) return null;
-      final json = jsonDecode(res.data as String);
+      final raw = res.data?.toString() ?? '';
+      print('[fetchBatchBusiVip] HTTP ${res.statusCode} len=${raw.length}');
+      if (raw.length < 400) print('[fetchBatchBusiVip] body: $raw');
+      final json = jsonDecode(raw);
       if (json is! Map<String, dynamic>) return null;
       final data = json['data'];
       if (data is! Map<String, dynamic>) return null;
@@ -3905,25 +3921,38 @@ class KugouApiClient {
       if (busi is! Map<String, dynamic>) return null;
       final list = busi[useridRaw] ?? busi[userid.toString()];
       if (list is! List) return null;
-      return list.whereType<Map<String, dynamic>>().toList();
+      final entries = list.whereType<Map<String, dynamic>>().toList();
+      print('[fetchBatchBusiVip] 命中 ${entries.length} 条业务线: '
+          '${entries.map((e) => "${e["product_type"]}=${e["vip_end_time"]}").join(", ")}');
+      return entries;
     } catch (e) {
-      print('[fetchBatchBusiVip] error: $e');
+      print('[fetchBatchBusiVip] 异常: $e');
       return null;
     }
   }
 
-  /// 读取 Rust 服务持久化的 `device_info.json` 中的 mid（上游签名必填，
-  /// 缺 mid 上游返回 error_code 20006）。文件由本地服务注册设备时写入
-  /// App 的 files 目录。
-  Future<String?> _readDeviceMid() async {
+  /// 读取 Rust 服务持久化的 `device_info.json`（含 mid/dfid，上游签名必填）。
+  /// 文件由本地服务注册设备时写入 App 的 files 目录；按多个候选目录查找，
+  /// 规避 path_provider 在不同平台/版本上的目录差异。
+  Future<Map<String, dynamic>?> _readDeviceInfo() async {
+    final dirs = <String>{};
     try {
-      final dir = await getApplicationDocumentsDirectory();
-      final f = File('${dir.path}/device_info.json');
-      if (await f.exists()) {
-        final j = jsonDecode(await f.readAsString());
-        if (j is Map && j['mid'] != null) return j['mid'].toString();
-      }
+      dirs.add((await getApplicationDocumentsDirectory()).path);
     } catch (_) {}
+    try {
+      dirs.add((await getApplicationSupportDirectory()).path);
+    } catch (_) {}
+    for (final dir in dirs) {
+      for (final rel in const ['device_info.json', 'files/device_info.json']) {
+        try {
+          final f = File('$dir/$rel');
+          if (await f.exists()) {
+            final j = jsonDecode(await f.readAsString());
+            if (j is Map<String, dynamic> && j['mid'] != null) return j;
+          }
+        } catch (_) {}
+      }
+    }
     return null;
   }
 
