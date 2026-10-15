@@ -195,36 +195,41 @@ jobs:
           ls -lh android/app/src/main/jniLibs/*/libkugou_server.so 2>/dev/null || echo "  WARNING: libkugou_server.so not found"
 
       # ============================================================
-      # 5. 下载持久化 release keystore
-      #    从 'keystore' release 下载 release.keystore，
-      #    并生成 keystore.properties（密码用 GitHub Secrets）
+      # 5. 持久化 release keystore（自举）
+      #    优先从 'keystore' release 下载；不存在则用 JDK keytool 现场生成
+      #    一个并上传到该 release。之后所有构建共用同一把钥匙，
+      #    覆盖安装（pm install -r）不再因签名变化而失败。
+      #    凭证与下方 keystore.properties 的默认值保持一致。
       # ============================================================
-      - name: Download release keystore
+      - name: Ensure persistent release keystore
         id: keystore
-        continue-on-error: true
         run: |
           set -e
-          echo "Downloading release.keystore from 'keystore' release..."
-          if ! curl -fL --retry 3 -o /tmp/release.keystore \
-              "https://github.com/${GITHUB_REPOSITORY}/releases/download/keystore/release.keystore"; then
-            echo ""
-            echo "============================================================"
-            echo "WARN: keystore release 不存在，使用 debug keystore 兜底"
-            echo ""
-            echo "首次启用持久签名需要："
-            echo "  1. 在本地生成 release.keystore"
-            echo "  2. 创建一个名为 'keystore' 的 release："
-            echo "     https://github.com/${GITHUB_REPOSITORY}/releases/new?tag=keystore"
-            echo "  3. 把 release.keystore 作为资产上传"
-            echo "  4. 重新触发本 workflow"
-            echo "============================================================"
-            echo "keystore_available=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          KS_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/keystore/release.keystore"
+          if curl -fL --retry 3 -o /tmp/release.keystore "$KS_URL"; then
+            echo "复用已存在的持久 keystore"
+          else
+            echo "未找到持久 keystore，生成新的并上传到 'keystore' release..."
+            rm -f /tmp/release.keystore
+            keytool -genkeypair -v \
+              -keystore /tmp/release.keystore \
+              -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=MD3Music, OU=MD3Music, O=MD3Music, L=CN, C=CN"
+            if gh release view keystore >/dev/null 2>&1; then
+              gh release upload keystore /tmp/release.keystore --clobber
+            else
+              gh release create keystore /tmp/release.keystore \
+                --title "MD3Music signing keystore" \
+                --notes "持久签名 keystore：由 CI 首次构建时自动生成，之后所有 release 共用同一签名，保证覆盖安装。"
+            fi
           fi
           cp /tmp/release.keystore android/app/release.keystore
-          rm /tmp/release.keystore
           ls -lh android/app/release.keystore
           echo "keystore_available=true" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate keystore.properties (for CI)
         if: steps.keystore.outputs.keystore_available == 'true'
