@@ -1146,8 +1146,8 @@ class _UserCenterPageState extends State<UserCenterPage> {
                             active: wvip,
                             title: '随心畅听包',
                             icon: Icons.card_membership,
-                            iconBg: cs.tertiaryContainer,
-                            iconFg: cs.onTertiaryContainer,
+                            iconBg: cs.secondaryContainer,
+                            iconFg: cs.onSecondaryContainer,
                           ),
                           const Gap(AppSpacing.sm),
                           _buildVipRow(
