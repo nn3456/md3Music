@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../data/models/dy_cover_models.dart';
@@ -4211,6 +4214,207 @@ class KugouApiClient {
     } catch (e) {
       return null;
     }
+  }
+
+  /// 批量会员信息（直连酷狗上游 kugouvip.kugou.com，绕过本地 Rust 服务）。
+  ///
+  /// 本地 `/user/vip/detail` 只转发 `/v1/get_union_vip`，仅返回各业务线当前
+  /// 周期；已购长期会员（如随心畅听包 wvip）只在
+  /// `POST https://kugouvip.kugou.com/v2/batch_union_vipinfo` 的
+  /// `data.busi_vip[<userid>]` 中返回。此处按本地服务相同的签名配方
+  /// （`md5(ROUTE + 排序参数拼接 + body原文 + ROUTE)`，ROUTE 与 Rust
+  /// `helper.rs` 一致；appid/clientver 取概念版常量）直接请求上游。
+  ///
+  /// 注意：mid 与 dfid 均为上游必填（缺失/为空返回 error_code 20006），必须从
+  /// Rust 服务持久化的 `device_info.json` 读取——客户端 SharedPreferences 在
+  /// 新版本已不再保存 kugou_dfid（`_dfid` 可能为 null）。任何失败返回 null，
+  /// 由调用方回退到 `/user/vip/detail`。
+  Future<List<Map<String, dynamic>>?> fetchBatchBusiVip() async {
+    final token = _token;
+    final useridRaw = _userid;
+    if (token == null || token.isEmpty || useridRaw == null || useridRaw.isEmpty) {
+      print('[fetchBatchBusiVip] 跳过：无 token/userid');
+      return null;
+    }
+    final dev = await _fetchLocalDevice();
+    final mid = dev?['mid']?.toString();
+    final dfid = dev?['dfid']?.toString() ?? _dfid ?? '';
+    if (mid == null || mid.isEmpty || dfid.isEmpty) {
+      print('[fetchBatchBusiVip] 跳过：local_device 缺 mid/dfid'
+          ' (mid=${mid != null}, dfid非空=${dfid.isNotEmpty})');
+      return null;
+    }
+
+    const route = 'LnT6xpN3khm36zse0QzvmgTZ3waWdRSA';
+    final userid = int.tryParse(useridRaw) ?? 0;
+    final params = <String, dynamic>{
+      'appid': 3116,
+      'clientver': 11440,
+      'clienttime': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      'dfid': dfid,
+      'mid': mid,
+      'token': token,
+      'userid': userid,
+    };
+    // body 必须紧凑 JSON（无空格）且键序固定，与签名计算逐字节一致
+    final body = jsonEncode({
+      'useridlist': [userid],
+      'get_type': 2,
+      'busi_type': 'concept',
+    });
+    final joined = (params.keys.toList()..sort())
+        .map((k) => '$k=${params[k]}')
+        .join();
+    params['signature'] =
+        md5.convert(utf8.encode(route + joined + body + route)).toString();
+
+    try {
+      // 全新 Dio 实例：避开全局拦截器（cookie/dfid 注入会破坏已计算的签名）
+      final res = await Dio().post<dynamic>(
+        'https://kugouvip.kugou.com/v2/batch_union_vipinfo',
+        queryParameters: params,
+        data: body,
+        options: Options(
+          headers: const {
+            'Content-Type': 'application/json;charset=utf-8',
+            'User-Agent': 'Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi',
+          },
+          responseType: ResponseType.plain,
+          validateStatus: (s) => s != null && s >= 200 && s < 500,
+        ),
+      );
+      final raw = res.data?.toString() ?? '';
+      print('[fetchBatchBusiVip] HTTP ${res.statusCode} len=${raw.length}');
+      if (raw.length < 400) print('[fetchBatchBusiVip] body: $raw');
+      final json = jsonDecode(raw);
+      if (json is! Map<String, dynamic>) return null;
+      final data = json['data'];
+      if (data is! Map<String, dynamic>) return null;
+      final busi = data['busi_vip'];
+      if (busi is! Map<String, dynamic>) return null;
+      final list = busi[useridRaw] ?? busi[userid.toString()];
+      if (list is! List) return null;
+      final entries = list.whereType<Map<String, dynamic>>().toList();
+      print('[fetchBatchBusiVip] 命中 ${entries.length} 条业务线: '
+          '${entries.map((e) => "${e["product_type"]}=${e["vip_end_time"]}").join(", ")}');
+      return entries;
+    } catch (e) {
+      print('[fetchBatchBusiVip] 异常: $e');
+      return null;
+    }
+  }
+
+  /// 会员入口信息（直连上游 `youth/v1/user/get_vip_entrance`）。
+  ///
+  /// 该端点一次给出各业务线的「含未领天数」累计到期日——即官方 App「我的」页
+  /// 会员卡片的展示口径：
+  ///   - `tvip_end_date_with_unclaimed` → 畅听会员（含各活动累积的年卡天数）
+  ///   - `svip_end_date_with_unclaimed` → 概念会员
+  ///   - `busi_vip[].vip_end_time`       → 各业务线当前周期（含随心畅听包 wvip）
+  /// 本地 Rust 服务未实现该路由，故按批量接口相同的签名配方直连上游。
+  /// 失败返回 null，由调用方逐级回退。
+  Future<List<Map<String, dynamic>>?> fetchVipEntrance() async {
+    final token = _token;
+    final useridRaw = _userid;
+    if (token == null || token.isEmpty || useridRaw == null || useridRaw.isEmpty) {
+      print('[fetchVipEntrance] 跳过：无 token/userid');
+      return null;
+    }
+    final dev = await _fetchLocalDevice();
+    final mid = dev?['mid']?.toString();
+    final dfid = dev?['dfid']?.toString() ?? _dfid ?? '';
+    if (mid == null || mid.isEmpty || dfid.isEmpty) {
+      print('[fetchVipEntrance] 跳过：local_device 缺 mid/dfid');
+      return null;
+    }
+
+    const route = 'LnT6xpN3khm36zse0QzvmgTZ3waWdRSA';
+    final userid = int.tryParse(useridRaw) ?? 0;
+    final params = <String, dynamic>{
+      'appid': 3116,
+      'clientver': 11440,
+      'clienttime': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      'dfid': dfid,
+      'mid': mid,
+      'token': token,
+      'userid': userid,
+    };
+    final joined = (params.keys.toList()..sort())
+        .map((k) => '$k=${params[k]}')
+        .join();
+    params['signature'] =
+        md5.convert(utf8.encode(route + joined + route)).toString();
+
+    try {
+      // 全新 Dio 实例：避开全局拦截器（cookie/dfid 注入会破坏已计算的签名）
+      final res = await Dio().get<dynamic>(
+        'https://gateway.kugou.com/youth/v1/user/get_vip_entrance',
+        queryParameters: params,
+        options: Options(
+          headers: const {
+            'User-Agent': 'Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi',
+          },
+          responseType: ResponseType.plain,
+          validateStatus: (s) => s != null && s >= 200 && s < 500,
+        ),
+      );
+      final raw = res.data?.toString() ?? '';
+      print('[fetchVipEntrance] HTTP ${res.statusCode} len=${raw.length}');
+      if (raw.length < 300) print('[fetchVipEntrance] body: $raw');
+      final json = jsonDecode(raw);
+      if (json is! Map<String, dynamic>) return null;
+      final data = json['data'];
+      if (data is! Map<String, dynamic>) return null;
+      final busi = data['busi_vip'];
+      if (busi is! List) return null;
+      final entries = busi.whereType<Map<String, dynamic>>().toList();
+      // 用「含未领天数」的累计到期日覆盖当前周期（官方 App 展示口径）：
+      // 畅听会员年卡天数来自各处活动累积，只在 tvip_end_date_with_unclaimed 体现。
+      _overrideVipEnd(entries, 'tvip', data['tvip_end_date_with_unclaimed']?.toString());
+      _overrideVipEnd(entries, 'svip', data['svip_end_date_with_unclaimed']?.toString());
+      print('[fetchVipEntrance] 命中 ${entries.length} 条: '
+          '${entries.map((e) => "${e["product_type"]}=${e["vip_end_time"]}").join(", ")}');
+      return entries;
+    } catch (e) {
+      print('[fetchVipEntrance] 异常: $e');
+      return null;
+    }
+  }
+
+  /// 把指定业务线的 `vip_end_time` 覆盖为累计到期日。
+  /// 纯日期（无时间分量）补到当天 23:59:59，展示更直观。
+  void _overrideVipEnd(
+    List<Map<String, dynamic>> entries,
+    String productType,
+    String? date,
+  ) {
+    if (date == null || date.isEmpty) return;
+    final idx =
+        entries.indexWhere((e) => e['product_type']?.toString() == productType);
+    if (idx < 0) return;
+    final v = date.length <= 10 ? '$date 23:59:59' : date;
+    entries[idx] = {...entries[idx], 'vip_end_time': v};
+  }
+
+  /// 获取本机设备标识（mid/dfid）——读本地 Rust 服务 `/login/device` 响应顶层
+  /// 注入的 `local_device` 字段（Rust `handle_device` 用 DeviceConfig 注入，
+  /// 即服务自身签名时使用的同一套值，天然一致）。
+  ///
+  /// 不读 device_info.json：该文件由服务注册时写入，重装/清数据后会缺失，
+  /// 且 path_provider 的目录在不同平台/版本上有差异。
+  Future<Map<String, dynamic>?> _fetchLocalDevice() async {
+    try {
+      final json = await _get(KugouEndpoints.loginDevice);
+      final local = json?['local_device'];
+      if (local is Map<String, dynamic> &&
+          local['mid'] != null &&
+          local['dfid'] != null) {
+        return local;
+      }
+    } catch (e) {
+      print('[fetchBatchBusiVip] _fetchLocalDevice 异常: $e');
+    }
+    return null;
   }
 
   /// 查询/上报听歌等级信息（v2/lite 协议）。

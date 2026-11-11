@@ -3014,6 +3014,32 @@ class KugouProvider extends ChangeNotifier {
   // ==================== User (用户) ====================
 
   Future<void> getVipDetail() async {
+    // 优先会员入口接口：一次给出三条业务线的「含未领」累计到期日
+    // （畅听会员 tvip / 随心畅听包 wvip / 概念会员 svip）。
+    try {
+      final entries = await _apiClient.fetchVipEntrance();
+      if (entries != null && entries.isNotEmpty) {
+        _vipInfo = KugouUserVipDetail(
+          isVip: entries.any((b) => b['is_vip'] == 1),
+          busiVipList: entries,
+        );
+        notifyListeners();
+        return;
+      }
+    } catch (_) {}
+    // 回退1：批量会员接口（各业务线当前周期 + 已购长期会员）。
+    try {
+      final entries = await _apiClient.fetchBatchBusiVip();
+      if (entries != null && entries.isNotEmpty) {
+        _vipInfo = KugouUserVipDetail(
+          isVip: entries.any((b) => b['is_vip'] == 1),
+          busiVipList: entries,
+        );
+        notifyListeners();
+        return;
+      }
+    } catch (_) {}
+    // 回退：本地 /user/vip/detail
     try {
       final r = await _apiClient.getUserVipDetail();
       if (r != null) {

@@ -485,6 +485,13 @@ class _SignInCalendarPageState extends State<SignInCalendarPage> {
           _buildExpiryRow(
             tt,
             cs,
+            '随心畅听包',
+            findActiveBusiVip(busiList, 'wvip'),
+          ),
+          const Gap(AppSpacing.sm),
+          _buildExpiryRow(
+            tt,
+            cs,
             '概念会员',
             findActiveBusiVip(busiList, 'svip'),
           ),
